@@ -19,7 +19,11 @@ from ._config import (
     Proxy,
     Timeout,
 )
-from ._decoders import SUPPORTED_DECODERS
+from ._decoders import (
+    SUPPORTED_DECODERS,
+    UnsupportedEncodingPolicy,
+    normalize_encodings,
+)
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
@@ -200,6 +204,11 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        accept_encoding: str | typing.Sequence[str] | None = ACCEPT_ENCODING,
+        decodable_encodings: typing.Sequence[str] | None = None,
+        unsupported_encoding_policy: UnsupportedEncodingPolicy = (
+            UnsupportedEncodingPolicy.PASS_THROUGH
+        ),
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -207,6 +216,29 @@ class BaseClient:
 
         self._auth = self._build_auth(auth)
         self._params = QueryParams(params)
+
+        # Content-encoding negotiation. Must be configured before `headers`,
+        # since the default headers include the Accept-Encoding declaration.
+        self._accept_encoding = self._normalize_accept_encoding(accept_encoding)
+        self._decodable_encodings = (
+            frozenset(
+                normalize_encodings(
+                    decodable_encodings,
+                    require_supported=True,
+                )
+            )
+            if decodable_encodings is not None
+            else frozenset(SUPPORTED_DECODERS)
+        )
+        if not isinstance(
+            unsupported_encoding_policy, UnsupportedEncodingPolicy
+        ):
+            raise TypeError(
+                "unsupported_encoding_policy must be an "
+                "UnsupportedEncodingPolicy instance."
+            )
+        self._unsupported_encoding_policy = unsupported_encoding_policy
+
         self.headers = Headers(headers)
         self._cookies = Cookies(cookies)
         self._timeout = Timeout(timeout)
@@ -219,6 +251,20 @@ class BaseClient:
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
+
+    @staticmethod
+    def _normalize_accept_encoding(
+        value: str | typing.Sequence[str] | None,
+    ) -> str | None:
+        """
+        Normalize the configured Accept-Encoding declaration into the header
+        value to send, or `None` to omit the header entirely.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        return ", ".join(normalize_encodings(value))
 
     @property
     def is_closed(self) -> bool:
@@ -304,14 +350,18 @@ class BaseClient:
 
     @headers.setter
     def headers(self, headers: HeaderTypes) -> None:
-        client_headers = Headers(
-            {
-                b"Accept": b"*/*",
-                b"Accept-Encoding": ACCEPT_ENCODING.encode("ascii"),
-                b"Connection": b"keep-alive",
-                b"User-Agent": USER_AGENT.encode("ascii"),
-            }
-        )
+        # Build the default headers, preserving the standard default header
+        # ordering. Accept-Encoding is omitted entirely if the client is
+        # configured not to declare any encodings.
+        default_headers: dict[bytes, bytes] = {b"Accept": b"*/*"}
+        if self._accept_encoding is not None:
+            default_headers[b"Accept-Encoding"] = self._accept_encoding.encode(
+                "ascii"
+            )
+        default_headers[b"Connection"] = b"keep-alive"
+        default_headers[b"User-Agent"] = USER_AGENT.encode("ascii")
+
+        client_headers = Headers(default_headers)
         client_headers.update(headers)
         self._headers = client_headers
 
@@ -351,6 +401,15 @@ class BaseClient:
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        accept_encoding: (
+            str | typing.Sequence[str] | None | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        decodable_encodings: (
+            typing.Sequence[str] | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        unsupported_encoding_policy: (
+            UnsupportedEncodingPolicy | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
     ) -> Request:
         """
         Build and return a request instance.
@@ -358,6 +417,17 @@ class BaseClient:
         * The `params`, `headers` and `cookies` arguments
         are merged with any values set on the client.
         * The `url` argument is merged with any `base_url` set on the client.
+
+        Per-request content-encoding configuration:
+
+        * `accept_encoding` - Override the Accept-Encoding declaration for
+          this request. A string is used verbatim, a sequence of encodings is
+          joined, and `None` removes the header. Defaults to the client-level
+          value.
+        * `decodable_encodings` - Limit the content-encodings which may be
+          decoded for this request. Must be a subset of the installed backends.
+        * `unsupported_encoding_policy` - Policy for unknown or undecodable
+          encodings for this request.
 
         See also: [Request instances][0]
 
@@ -368,6 +438,44 @@ class BaseClient:
         cookies = self._merge_cookies(cookies)
         params = self._merge_queryparams(params)
         extensions = {} if extensions is None else extensions
+
+        # Per-request Accept-Encoding declaration.
+        if not isinstance(accept_encoding, UseClientDefault):
+            if accept_encoding is None:
+                headers.pop("Accept-Encoding", None)
+            elif isinstance(accept_encoding, str):
+                headers["Accept-Encoding"] = accept_encoding
+            else:
+                headers["Accept-Encoding"] = ", ".join(
+                    normalize_encodings(accept_encoding)
+                )
+
+        # Resolve the response decoding configuration, and carry it on the
+        # request extensions so it reaches the response and follows redirects.
+        if isinstance(decodable_encodings, UseClientDefault):
+            resolved_decodable = self._decodable_encodings
+        else:
+            resolved_decodable = frozenset(
+                normalize_encodings(
+                    decodable_encodings,
+                    require_supported=True,
+                )
+            )
+        if isinstance(unsupported_encoding_policy, UseClientDefault):
+            resolved_policy = self._unsupported_encoding_policy
+        elif not isinstance(
+            unsupported_encoding_policy, UnsupportedEncodingPolicy
+        ):
+            raise TypeError(
+                "unsupported_encoding_policy must be an "
+                "UnsupportedEncodingPolicy instance."
+            )
+        else:
+            resolved_policy = unsupported_encoding_policy
+
+        extensions.setdefault("decodable_encodings", resolved_decodable)
+        extensions.setdefault("unsupported_encoding_policy", resolved_policy)
+
         if "timeout" not in extensions:
             timeout = (
                 self.timeout
@@ -658,6 +766,11 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        accept_encoding: str | typing.Sequence[str] | None = ACCEPT_ENCODING,
+        decodable_encodings: typing.Sequence[str] | None = None,
+        unsupported_encoding_policy: UnsupportedEncodingPolicy = (
+            UnsupportedEncodingPolicy.PASS_THROUGH
+        ),
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +784,9 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
 
         if http2:
@@ -784,6 +900,15 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        accept_encoding: (
+            str | typing.Sequence[str] | None | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        decodable_encodings: (
+            typing.Sequence[str] | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        unsupported_encoding_policy: (
+            UnsupportedEncodingPolicy | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
     ) -> Response:
         """
         Build and send a request.
@@ -821,6 +946,9 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -841,6 +969,15 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        accept_encoding: (
+            str | typing.Sequence[str] | None | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        decodable_encodings: (
+            typing.Sequence[str] | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        unsupported_encoding_policy: (
+            UnsupportedEncodingPolicy | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
     ) -> typing.Iterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -864,6 +1001,9 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
         response = self.send(
             request=request,
@@ -1021,6 +1161,14 @@ class Client(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        # Configure content-encoding negotiation from the request extensions,
+        # falling back to the client-level configuration.
+        response.decodable_encodings = request.extensions.get(
+            "decodable_encodings", self._decodable_encodings
+        )
+        response.unsupported_encoding_policy = request.extensions.get(
+            "unsupported_encoding_policy", self._unsupported_encoding_policy
+        )
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1372,6 +1520,11 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        accept_encoding: str | typing.Sequence[str] | None = ACCEPT_ENCODING,
+        decodable_encodings: typing.Sequence[str] | None = None,
+        unsupported_encoding_policy: UnsupportedEncodingPolicy = (
+            UnsupportedEncodingPolicy.PASS_THROUGH
+        ),
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1538,9 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
 
         if http2:
@@ -1498,6 +1654,15 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        accept_encoding: (
+            str | typing.Sequence[str] | None | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        decodable_encodings: (
+            typing.Sequence[str] | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        unsupported_encoding_policy: (
+            UnsupportedEncodingPolicy | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
     ) -> Response:
         """
         Build and send a request.
@@ -1536,6 +1701,9 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -1556,6 +1724,15 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        accept_encoding: (
+            str | typing.Sequence[str] | None | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        decodable_encodings: (
+            typing.Sequence[str] | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
+        unsupported_encoding_policy: (
+            UnsupportedEncodingPolicy | UseClientDefault
+        ) = USE_CLIENT_DEFAULT,
     ) -> typing.AsyncIterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -1579,6 +1756,9 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            accept_encoding=accept_encoding,
+            decodable_encodings=decodable_encodings,
+            unsupported_encoding_policy=unsupported_encoding_policy,
         )
         response = await self.send(
             request=request,
@@ -1736,6 +1916,14 @@ class AsyncClient(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+        # Configure content-encoding negotiation from the request extensions,
+        # falling back to the client-level configuration.
+        response.decodable_encodings = request.extensions.get(
+            "decodable_encodings", self._decodable_encodings
+        )
+        response.unsupported_encoding_policy = request.extensions.get(
+            "unsupported_encoding_policy", self._unsupported_encoding_policy
+        )
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',

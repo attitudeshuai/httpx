@@ -7,6 +7,7 @@ See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
 from __future__ import annotations
 
 import codecs
+import enum
 import io
 import typing
 import zlib
@@ -179,6 +180,11 @@ class ZStandardDecoder(ContentDecoder):
 
     def decode(self, data: bytes) -> bytes:
         assert zstandard is not None
+        if self.decompressor.eof:
+            # A zstd decompressobj cannot be used again once it has reached
+            # the end of a frame. Decoder chains may still issue a final
+            # `decode(b"")` call, which should be a no-op.
+            return b""
         self.seen_data = True
         output = io.BytesIO()
         try:
@@ -205,24 +211,72 @@ class MultiDecoder(ContentDecoder):
     Handle the case where multiple encodings have been applied.
     """
 
-    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+    def __init__(
+        self,
+        children: typing.Sequence[ContentDecoder],
+        names: typing.Sequence[str] | None = None,
+    ) -> None:
         """
         'children' should be a sequence of decoders in the order in which
-        each was applied.
+        each encoding was applied (the order given in the Content-Encoding
+        header). 'names' optionally provides the encoding token corresponding
+        to each decoder, used for attributing failures.
+
+        Decoding is performed in the reverse order, from the outermost
+        encoding to the innermost encoding.
         """
-        # Note that we reverse the order for decoding.
-        self.children = list(reversed(children))
+        if names is None:
+            names = [""] * len(children)
+
+        # Reverse so that layers are ordered from the outermost encoding inwards.
+        self.layers = list(zip(names, children))
+        self.layers.reverse()
 
     def decode(self, data: bytes) -> bytes:
-        for child in self.children:
-            data = child.decode(data)
+        for layer_index, (name, child) in enumerate(self.layers):
+            try:
+                data = child.decode(data)
+            except DecodingError as exc:
+                raise self._build_error(exc, layer_index, name, data) from exc
         return data
 
     def flush(self) -> bytes:
         data = b""
-        for child in self.children:
-            data = child.decode(data) + child.flush()
+        for layer_index, (name, child) in enumerate(self.layers):
+            try:
+                # `decode(b"")` is a no-op for every decoder and would only
+                # spuriously mark state (e.g. for zstd). Only propagate real
+                # bytes between layers; each layer's `flush()` handles EOF.
+                if data:
+                    data = child.decode(data) + child.flush()
+                else:
+                    data = child.flush()
+            except DecodingError as exc:
+                raise self._build_error(exc, layer_index, name, data) from exc
         return data
+
+    def _build_error(
+        self,
+        exc: DecodingError,
+        layer_index: int,
+        name: str,
+        partial_content: bytes,
+    ) -> DecodingError:
+        """
+        Wrap a decoder-level failure in an attributed DecodingError which
+        indicates which layer failed and preserves what outer layers had
+        already decoded.
+        """
+        message = (
+            f"Failed to decode content-encoding layer {layer_index + 1} of "
+            f"{len(self.layers)} ({name!r}): {exc}"
+        )
+        return DecodingError(
+            message,
+            encoding=name or None,
+            layer=layer_index,
+            partial_content=partial_content,
+        )
 
 
 class ByteChunker:
@@ -391,3 +445,50 @@ if brotli is None:
     SUPPORTED_DECODERS.pop("br")  # pragma: no cover
 if zstandard is None:
     SUPPORTED_DECODERS.pop("zstd")  # pragma: no cover
+
+
+class UnsupportedEncodingPolicy(enum.Enum):
+    """
+    Policy for handling response content-encodings which cannot be decoded,
+    either because they are unknown to httpx, or because the local machine
+    is missing the backend required to decode them.
+
+    * `PASS_THROUGH` - The affected layer is left undecoded, with the raw
+      bytes being passed through. This is the default httpx behaviour.
+    * `RAISE` - An `UnsupportedEncodingError` is raised.
+    """
+
+    PASS_THROUGH = "passthrough"
+    RAISE = "raise"
+
+
+def normalize_encodings(
+    values: typing.Iterable[str],
+    *,
+    require_supported: bool = False,
+) -> tuple[str, ...]:
+    """
+    Normalize an iterable of content-encoding tokens into a tuple of
+    stripped, lowercase tokens, with duplicates removed (first occurrence
+    kept).
+
+    If `require_supported=True` then each token must correspond to an
+    installed decoder backend, otherwise a `ValueError` is raised.
+    """
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError(
+                f"Content-encoding must be a string, but got {type(value)!r}."
+            )
+        token = value.strip().lower()
+        if not token:
+            raise ValueError("Content-encoding tokens must not be empty.")
+        if token not in result:
+            result.append(token)
+        if require_supported and token not in SUPPORTED_DECODERS:
+            raise ValueError(
+                f"Unsupported content-encoding {value!r}. Must be one of: "
+                f"{', '.join(SUPPORTED_DECODERS)}."
+            )
+    return tuple(result)

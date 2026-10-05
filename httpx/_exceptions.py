@@ -20,6 +20,7 @@ Our exception hierarchy:
       - ProxyError
       - UnsupportedProtocol
     + DecodingError
+      · UnsupportedEncodingError
     + TooManyRedirects
   x HTTPStatusError
 * InvalidURL
@@ -65,6 +66,7 @@ __all__ = [
     "TimeoutException",
     "TooManyRedirects",
     "TransportError",
+    "UnsupportedEncodingError",
     "UnsupportedProtocol",
     "WriteError",
     "WriteTimeout",
@@ -243,7 +245,57 @@ class RemoteProtocolError(ProtocolError):
 class DecodingError(RequestError):
     """
     Decoding of the response failed, due to a malformed encoding.
+
+    The following attributes are available for attributing the failure:
+
+    * `.encoding` - The name of the content-encoding which failed,
+      e.g. `"gzip"`. `None` if the failure cannot be attributed to an encoding.
+    * `.layer` - The zero-based index of the failing layer, counting from the
+      outermost encoding inwards. `None` if the failure cannot be attributed
+      to a layer.
+    * `.partial_content` - The bytes which had already been successfully decoded
+      before the failure occurred. May be empty.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: Request | None = None,
+        encoding: str | None = None,
+        layer: int | None = None,
+        partial_content: bytes = b"",
+    ) -> None:
+        super().__init__(message, request=request)
+        self.encoding = encoding
+        self.layer = layer
+        self.partial_content = partial_content
+
+
+class UnsupportedEncodingError(DecodingError):
+    """
+    The response used a content-encoding which is not supported, either
+    because the encoding is unknown to httpx, or because the local machine
+    is missing the backend required to decode it.
+
+    Raised only when the decoding policy has been configured to fail on
+    unsupported encodings.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        encoding: str,
+        request: Request | None = None,
+        layer: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            request=request,
+            encoding=encoding,
+            layer=layer,
+        )
 
 
 class TooManyRedirects(RequestError):

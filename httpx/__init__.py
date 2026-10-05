@@ -4,6 +4,7 @@ from ._auth import *
 from ._client import *
 from ._config import *
 from ._content import *
+from ._decoders import UnsupportedEncodingPolicy
 from ._exceptions import *
 from ._models import *
 from ._status_codes import *
@@ -91,6 +92,8 @@ __all__ = [
     "TimeoutException",
     "TooManyRedirects",
     "TransportError",
+    "UnsupportedEncodingError",
+    "UnsupportedEncodingPolicy",
     "UnsupportedProtocol",
     "URL",
     "USE_CLIENT_DEFAULT",

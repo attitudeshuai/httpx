@@ -13,6 +13,7 @@ from http.cookiejar import Cookie, CookieJar
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
+    UnsupportedEncodingPolicy,
     ByteChunker,
     ContentDecoder,
     IdentityDecoder,
@@ -23,11 +24,13 @@ from ._decoders import (
 )
 from ._exceptions import (
     CookieConflict,
+    DecodingError,
     HTTPStatusError,
     RequestNotRead,
     ResponseNotRead,
     StreamClosed,
     StreamConsumed,
+    UnsupportedEncodingError,
     request_context,
 )
 from ._multipart import get_multipart_boundary_from_content_type
@@ -545,6 +548,14 @@ class Response:
 
         self.default_encoding = default_encoding
 
+        # Content-encoding negotiation configuration.
+        # Defaults preserve the standard httpx behaviour: every installed
+        # backend is acceptable, and unsupported encodings pass through.
+        self._decodable_encodings: frozenset[str] = frozenset(SUPPORTED_DECODERS)
+        self._unsupported_encoding_policy: UnsupportedEncodingPolicy = (
+            UnsupportedEncodingPolicy.PASS_THROUGH
+        )
+
         if stream is None:
             headers, stream = encode_response(content, text, html, json)
             self._prepare(headers)
@@ -696,30 +707,123 @@ class Response:
 
         return _parse_content_type_charset(content_type)
 
+    @property
+    def content_encodings(self) -> tuple[str, ...]:
+        """
+        The content-codings applied to the response, as listed in the
+        Content-Encoding header, in the order in which they were applied.
+        """
+        values = self.headers.get_list("content-encoding", split_commas=True)
+        tokens: list[str] = []
+        for value in values:
+            token = value.strip().lower()
+            if token:
+                tokens.append(token)
+        return tuple(tokens)
+
+    @property
+    def decodable_encodings(self) -> frozenset[str]:
+        """
+        The set of content-codings which may be decoded for this response.
+        """
+        return self._decodable_encodings
+
+    @decodable_encodings.setter
+    def decodable_encodings(self, value: typing.Iterable[str]) -> None:
+        self._decodable_encodings = frozenset(value)
+        if hasattr(self, "_decoder"):
+            # Force the chain to be rebuilt with the new configuration.
+            del self._decoder
+
+    @property
+    def unsupported_encoding_policy(self) -> UnsupportedEncodingPolicy:
+        """
+        The policy used when the response uses a content-encoding which is
+        unknown or missing a local backend.
+        """
+        return self._unsupported_encoding_policy
+
+    @unsupported_encoding_policy.setter
+    def unsupported_encoding_policy(
+        self, value: UnsupportedEncodingPolicy
+    ) -> None:
+        self._unsupported_encoding_policy = value
+        if hasattr(self, "_decoder"):
+            # Force the chain to be rebuilt with the new configuration.
+            del self._decoder
+
     def _get_content_decoder(self) -> ContentDecoder:
         """
         Returns a decoder instance which can be used to decode the raw byte
         content, depending on the Content-Encoding used in the response.
         """
         if not hasattr(self, "_decoder"):
-            decoders: list[ContentDecoder] = []
-            values = self.headers.get_list("content-encoding", split_commas=True)
-            for value in values:
-                value = value.strip().lower()
-                try:
-                    decoder_cls = SUPPORTED_DECODERS[value]
-                    decoders.append(decoder_cls())
-                except KeyError:
-                    continue
-
-            if len(decoders) == 1:
-                self._decoder = decoders[0]
-            elif len(decoders) > 1:
-                self._decoder = MultiDecoder(children=decoders)
-            else:
-                self._decoder = IdentityDecoder()
-
+            self._decoder = self._build_content_decoder()
         return self._decoder
+
+    def _build_content_decoder(self) -> ContentDecoder:
+        """
+        Build the decoder chain for this response.
+
+        Encodings are decoded from the outermost layer inwards. An encoding
+        which is unknown, missing a backend, or excluded from the acceptable
+        set is handled according to the configured policy: either passed
+        through unchanged (the default) or raised as an explicit
+        `UnsupportedEncodingError`.
+        """
+        tokens = self.content_encodings
+        if not tokens:
+            return IdentityDecoder()
+
+        names: list[str] = []
+        children: list[ContentDecoder] = []
+
+        for token_index, token in enumerate(tokens):
+            decoder_cls = SUPPORTED_DECODERS.get(token)
+
+            if decoder_cls is None or token not in self._decodable_encodings:
+                # Count layers from the outermost encoding inwards, which is
+                # the reverse of the order in the Content-Encoding header.
+                layer = len(tokens) - 1 - token_index
+                if (
+                    self._unsupported_encoding_policy
+                    is UnsupportedEncodingPolicy.RAISE
+                ):
+                    if decoder_cls is None:
+                        message = (
+                            f"Unknown content-encoding {token!r} in layer "
+                            f"{layer + 1} of {len(tokens)}."
+                        )
+                    else:
+                        message = (
+                            f"Content-encoding {token!r} in layer "
+                            f"{layer + 1} of {len(tokens)} is not acceptable."
+                        )
+                    raise UnsupportedEncodingError(
+                        message, encoding=token, layer=layer
+                    )
+                names.append(token)
+                children.append(IdentityDecoder())
+                continue
+
+            try:
+                decoder = decoder_cls()
+            except ImportError as exc:
+                layer = len(tokens) - 1 - token_index
+                if (
+                    self._unsupported_encoding_policy
+                    is UnsupportedEncodingPolicy.RAISE
+                ):
+                    raise UnsupportedEncodingError(
+                        str(exc), encoding=token, layer=layer
+                    ) from exc
+                names.append(token)
+                children.append(IdentityDecoder())
+            else:
+                names.append(token)
+                children.append(decoder)
+
+        return MultiDecoder(children=children, names=names)
 
     @property
     def is_informational(self) -> bool:
@@ -890,19 +994,39 @@ class Response:
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
                 yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
+            return
+
+        decoder = self._get_content_decoder()
+        chunker = ByteChunker(chunk_size=chunk_size)
+        # Chunks fully decoded before the failing call. Used to preserve the
+        # already-decoded part on the raised exception.
+        completed: list[bytes] = []
+        try:
             with request_context(request=self._request):
                 for raw_bytes in self.iter_raw():
                     decoded = decoder.decode(raw_bytes)
+                    completed.append(decoded)
                     for chunk in chunker.decode(decoded):
                         yield chunk
                 decoded = decoder.flush()
+                completed.append(decoded)
                 for chunk in chunker.decode(decoded):
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():
                     yield chunk
+        except DecodingError as exc:
+            # Combine fully-decoded chunks with whatever earlier layers of
+            # the failing call had already decoded.
+            exc.partial_content = b"".join(completed) + (
+                exc.partial_content or b""
+            )
+            raise
+        finally:
+            # Deterministic lifecycle: normal exhaustion is closed by
+            # `iter_raw`; any error or early termination closes the response
+            # without running the decoder's flush.
+            if not self.is_closed:
+                self.close()
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -947,16 +1071,19 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
-
-        self.close()
+            for chunk in chunker.flush():
+                yield chunk
+        finally:
+            # Deterministic behaviour: the stream is always closed on normal
+            # exhaustion, errors, or early termination.
+            self.close()
 
     def close(self) -> None:
         """
@@ -990,19 +1117,39 @@ class Response:
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
                 yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
+            return
+
+        decoder = self._get_content_decoder()
+        chunker = ByteChunker(chunk_size=chunk_size)
+        # Chunks fully decoded before the failing call. Used to preserve the
+        # already-decoded part on the raised exception.
+        completed: list[bytes] = []
+        try:
             with request_context(request=self._request):
                 async for raw_bytes in self.aiter_raw():
                     decoded = decoder.decode(raw_bytes)
+                    completed.append(decoded)
                     for chunk in chunker.decode(decoded):
                         yield chunk
                 decoded = decoder.flush()
+                completed.append(decoded)
                 for chunk in chunker.decode(decoded):
                     yield chunk  # pragma: no cover
                 for chunk in chunker.flush():
                     yield chunk
+        except DecodingError as exc:
+            # Combine fully-decoded chunks with whatever earlier layers of
+            # the failing call had already decoded.
+            exc.partial_content = b"".join(completed) + (
+                exc.partial_content or b""
+            )
+            raise
+        finally:
+            # Deterministic lifecycle: normal exhaustion is closed by
+            # `aiter_raw`; any error or early termination closes the response
+            # without running the decoder's flush.
+            if not self.is_closed:
+                await self.aclose()
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1051,16 +1198,19 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
-
-        await self.aclose()
+            for chunk in chunker.flush():
+                yield chunk
+        finally:
+            # Deterministic behaviour: the stream is always closed on normal
+            # exhaustion, errors, or early termination.
+            await self.aclose()
 
     async def aclose(self) -> None:
         """
