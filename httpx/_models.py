@@ -10,6 +10,9 @@ import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
 
+if typing.TYPE_CHECKING:  # pragma: no cover
+    from ._hooks import HookExecution
+
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
@@ -380,6 +383,10 @@ class Headers(typing.MutableMapping[str, str]):
 
 
 class Request:
+    # Set by the client on requests sent while hooks are registered, holding
+    # the per-request hook execution context and its outcome records.
+    hook_execution: HookExecution | None
+
     def __init__(
         self,
         method: str,

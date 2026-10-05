@@ -26,6 +26,13 @@ from ._exceptions import (
     TooManyRedirects,
     request_context,
 )
+from ._hooks import (
+    EventHook,
+    EventHooks,
+    HookExecution,
+    HookPolicyTypes,
+    normalize_hook_policy,
+)
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
@@ -89,6 +96,18 @@ def _same_origin(url: URL, other: URL) -> bool:
         and url.host == other.host
         and _port_or_default(url) == _port_or_default(other)
     )
+
+
+def _request_of(exc: BaseException, default: Request) -> Request:
+    """
+    Return the request attached to an exception, if it has one, falling back
+    to the given default. (HTTPError's `.request` raises if unset.)
+    """
+    try:
+        request = exc.request  # type: ignore[attr-defined]
+    except (RuntimeError, AttributeError):
+        return default
+    return typing.cast(Request, request)
 
 
 class UseClientDefault:
@@ -182,9 +201,6 @@ class BoundAsyncStream(AsyncByteStream):
         await self._stream.aclose()
 
 
-EventHook = typing.Callable[..., typing.Any]
-
-
 class BaseClient:
     def __init__(
         self,
@@ -199,6 +215,7 @@ class BaseClient:
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         trust_env: bool = True,
+        hook_error_policy: HookPolicyTypes = "raise",
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
@@ -212,10 +229,8 @@ class BaseClient:
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
-        self._event_hooks = {
-            "request": list(event_hooks.get("request", [])),
-            "response": list(event_hooks.get("response", [])),
-        }
+        self._event_hooks = EventHooks(event_hooks)
+        self._hook_error_policy = normalize_hook_policy(hook_error_policy)
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
@@ -259,15 +274,37 @@ class BaseClient:
         self._timeout = Timeout(timeout)
 
     @property
-    def event_hooks(self) -> dict[str, list[EventHook]]:
+    def event_hooks(self) -> EventHooks:
+        """
+        The registry of installed event hooks, keyed by stage name.
+
+        The same live registry is returned each time; it may be inspected or
+        mutated freely. In-flight requests always run against the immutable
+        snapshot they took when they were sent, so mutations never disturb a
+        traversal that is already running.
+        """
         return self._event_hooks
 
     @event_hooks.setter
-    def event_hooks(self, event_hooks: dict[str, list[EventHook]]) -> None:
-        self._event_hooks = {
-            "request": list(event_hooks.get("request", [])),
-            "response": list(event_hooks.get("response", [])),
+    def event_hooks(
+        self, event_hooks: typing.Mapping[str, list[EventHook]]
+    ) -> None:
+        self._event_hooks.replace(event_hooks)
+
+    @property
+    def hook_error_policy(self) -> dict[str, str]:
+        """
+        Per-stage policy used when a hook raises an exception. Values are
+        ``"raise"`` (propagate immediately) or ``"continue"`` (record and
+        continue with later hooks).
+        """
+        return {
+            stage: policy.value for stage, policy in self._hook_error_policy.items()
         }
+
+    @hook_error_policy.setter
+    def hook_error_policy(self, hook_error_policy: HookPolicyTypes) -> None:
+        self._hook_error_policy = normalize_hook_policy(hook_error_policy)
 
     @property
     def auth(self) -> Auth | None:
@@ -657,6 +694,7 @@ class Client(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
+        hook_error_policy: HookPolicyTypes = "raise",
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
         super().__init__(
@@ -670,6 +708,7 @@ class Client(BaseClient):
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
+            hook_error_policy=hook_error_policy,
             default_encoding=default_encoding,
         )
 
@@ -911,21 +950,41 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = self._send_handling_auth(
+        # The whole request chain, including any auth round trips and
+        # redirects, runs against this immutable snapshot of the hook
+        # registry, so later mutations can never disturb its traversal.
+        hook_execution = HookExecution(
             request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
+            self._event_hooks.snapshot(),
+            self._hook_error_policy,
         )
+        if not self._event_hooks.is_empty():
+            request.hook_execution = hook_execution
+
         try:
-            if not stream:
-                response.read()
+            response = self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+                hooks=hook_execution,
+            )
+            try:
+                if not stream:
+                    response.read()
+                    hook_execution.run(
+                        "response_complete", response.request, response
+                    )
 
-            return response
+                hook_execution.run("hop_end", response.request, response)
+                return response
 
+            except BaseException as exc:
+                response.close()
+                raise exc
         except BaseException as exc:
-            response.close()
-            raise exc
+            hook_execution.fire_error(_request_of(exc, request), exc)
+            raise
 
     def _send_handling_auth(
         self,
@@ -933,6 +992,7 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        hooks: HookExecution,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +1003,7 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    hooks=hooks,
                 )
                 try:
                     try:
@@ -952,6 +1013,8 @@ class Client(BaseClient):
 
                     response.history = list(history)
                     response.read()
+                    hooks.run("response_complete", response.request, response)
+                    hooks.run("hop_end", response.request, response)
                     request = next_request
                     history.append(response)
 
@@ -966,6 +1029,7 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        hooks: HookExecution,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -973,13 +1037,11 @@ class Client(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
-            for hook in self._event_hooks["request"]:
-                hook(request)
+            hooks.run("request", request)
 
             response = self._send_single_request(request)
             try:
-                for hook in self._event_hooks["response"]:
-                    hook(response)
+                hooks.run("response", request, response)
                 response.history = list(history)
 
                 if not response.has_redirect_location:
@@ -990,8 +1052,11 @@ class Client(BaseClient):
 
                 if follow_redirects:
                     response.read()
+                    hooks.run("response_complete", response.request, response)
+                    hooks.run("hop_end", response.request, response)
                 else:
                     response.next_request = request
+                    hooks.run("hop_end", response.request, response)
                     return response
 
             except BaseException as exc:
@@ -1370,6 +1435,7 @@ class AsyncClient(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
+        hook_error_policy: HookPolicyTypes = "raise",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
@@ -1384,6 +1450,7 @@ class AsyncClient(BaseClient):
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
+            hook_error_policy=hook_error_policy,
             default_encoding=default_encoding,
         )
 
@@ -1626,21 +1693,41 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = await self._send_handling_auth(
+        # The whole request chain, including any auth round trips and
+        # redirects, runs against this immutable snapshot of the hook
+        # registry, so later mutations can never disturb its traversal.
+        hook_execution = HookExecution(
             request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
+            self._event_hooks.snapshot(),
+            self._hook_error_policy,
         )
+        if not self._event_hooks.is_empty():
+            request.hook_execution = hook_execution
+
         try:
-            if not stream:
-                await response.aread()
+            response = await self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+                hooks=hook_execution,
+            )
+            try:
+                if not stream:
+                    await response.aread()
+                    await hook_execution.arun(
+                        "response_complete", response.request, response
+                    )
 
-            return response
+                await hook_execution.arun("hop_end", response.request, response)
+                return response
 
+            except BaseException as exc:
+                await response.aclose()
+                raise exc
         except BaseException as exc:
-            await response.aclose()
-            raise exc
+            await hook_execution.afire_error(_request_of(exc, request), exc)
+            raise
 
     async def _send_handling_auth(
         self,
@@ -1648,6 +1735,7 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        hooks: HookExecution,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1746,7 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    hooks=hooks,
                 )
                 try:
                     try:
@@ -1667,6 +1756,10 @@ class AsyncClient(BaseClient):
 
                     response.history = list(history)
                     await response.aread()
+                    await hooks.arun(
+                        "response_complete", response.request, response
+                    )
+                    await hooks.arun("hop_end", response.request, response)
                     request = next_request
                     history.append(response)
 
@@ -1681,6 +1774,7 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        hooks: HookExecution,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1688,14 +1782,11 @@ class AsyncClient(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
-            for hook in self._event_hooks["request"]:
-                await hook(request)
+            await hooks.arun("request", request)
 
             response = await self._send_single_request(request)
             try:
-                for hook in self._event_hooks["response"]:
-                    await hook(response)
-
+                await hooks.arun("response", request, response)
                 response.history = list(history)
 
                 if not response.has_redirect_location:
@@ -1706,8 +1797,13 @@ class AsyncClient(BaseClient):
 
                 if follow_redirects:
                     await response.aread()
+                    await hooks.arun(
+                        "response_complete", response.request, response
+                    )
+                    await hooks.arun("hop_end", response.request, response)
                 else:
                     response.next_request = request
+                    await hooks.arun("hop_end", response.request, response)
                     return response
 
             except BaseException as exc:

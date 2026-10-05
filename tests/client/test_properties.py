@@ -57,7 +57,13 @@ def test_client_event_hooks():
 
     client = httpx.Client()
     client.event_hooks = {"request": [on_request]}
-    assert client.event_hooks == {"request": [on_request], "response": []}
+    assert client.event_hooks == {
+        "request": [on_request],
+        "response": [],
+        "response_complete": [],
+        "hop_end": [],
+        "error": [],
+    }
 
 
 def test_client_trust_env():
