@@ -16,6 +16,7 @@ from ._config import (
     DEFAULT_MAX_REDIRECTS,
     DEFAULT_TIMEOUT_CONFIG,
     Limits,
+    OriginKey,
     Proxy,
     Timeout,
 )
@@ -29,7 +30,11 @@ from ._exceptions import (
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
-from ._transports.default import AsyncHTTPTransport, HTTPTransport
+from ._transports.default import (
+    AsyncHTTPTransport,
+    HTTPTransport,
+    OriginPoolStats,
+)
 from ._types import (
     AsyncByteStream,
     AuthTypes,
@@ -1272,6 +1277,19 @@ class Client(BaseClient):
                 if transport is not None:
                     transport.close()
 
+    def get_origin_stats(self) -> dict[OriginKey, OriginPoolStats]:
+        """
+        Return a read-only snapshot of per-origin in-flight, waiting and idle
+        connection counts, aggregated over the client's transports and mounts.
+        """
+        stats: dict[OriginKey, OriginPoolStats] = {}
+        transports = [self._transport, *self._mounts.values()]
+        for transport in transports:
+            get_stats = getattr(transport, "get_origin_stats", None)
+            if get_stats is not None:
+                stats.update(get_stats())
+        return stats
+
     def __enter__(self: T) -> T:
         if self._state != ClientState.UNOPENED:
             msg = {
@@ -1986,6 +2004,19 @@ class AsyncClient(BaseClient):
             for proxy in self._mounts.values():
                 if proxy is not None:
                     await proxy.aclose()
+
+    async def get_origin_stats(self) -> dict[OriginKey, OriginPoolStats]:
+        """
+        Return a read-only snapshot of per-origin in-flight, waiting and idle
+        connection counts, aggregated over the client's transports and mounts.
+        """
+        stats: dict[OriginKey, OriginPoolStats] = {}
+        transports = [self._transport, *self._mounts.values()]
+        for transport in transports:
+            get_stats = getattr(transport, "get_origin_stats", None)
+            if get_stats is not None:
+                stats.update(await get_stats())
+        return stats
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:

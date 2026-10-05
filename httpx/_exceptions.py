@@ -9,6 +9,7 @@ Our exception hierarchy:
         · ReadTimeout
         · WriteTimeout
         · PoolTimeout
+        · OriginPoolTimeout
       - NetworkError
         · ConnectError
         · ReadError
@@ -50,6 +51,7 @@ __all__ = [
     "InvalidURL",
     "LocalProtocolError",
     "NetworkError",
+    "OriginPoolTimeout",
     "PoolTimeout",
     "ProtocolError",
     "ProxyError",
@@ -159,6 +161,24 @@ class PoolTimeout(TimeoutException):
     """
     Timed out waiting to acquire a connection from the pool.
     """
+
+
+class OriginPoolTimeout(PoolTimeout):
+    """
+    Timed out while waiting for a per-origin connection quota.
+
+    Raised by the per-origin quota gate, independently of the global pool
+    timeout. The origin whose quota was exhausted is available as `.origin`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        origin: tuple[str, str, int],
+    ) -> None:
+        super().__init__(message)
+        self.origin = origin
 
 
 # Core networking exceptions...

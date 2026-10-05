@@ -10,7 +10,7 @@ from ._urls import URL
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
 
-__all__ = ["Limits", "Proxy", "Timeout", "create_ssl_context"]
+__all__ = ["Limits", "OriginLimits", "Proxy", "Timeout", "create_ssl_context"]
 
 
 class UnsetType:
@@ -18,6 +18,114 @@ class UnsetType:
 
 
 UNSET = UnsetType()
+
+# An origin is identified by the (scheme, host, port) triple. Host is the
+# IDNA-encoded ASCII host, as found on `URL.raw_host`.
+OriginKey = typing.Tuple[str, str, int]
+
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
+
+
+def origin_key(url: URL) -> OriginKey:
+    """
+    Return the normalized (scheme, host, port) origin key for a URL, filling
+    in the scheme's default port when no explicit port is present - matching
+    the origin semantics used by httpcore.
+    """
+    scheme = url.raw_scheme.decode("ascii")
+    port = url.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme, 0)
+    return (scheme, url.raw_host.decode("ascii"), port)
+
+
+def _validate_int(
+    value: typing.Any, name: str, *, allow_zero: bool = False
+) -> typing.Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, but got {value!r}.")
+    int_value: int = value
+    if int_value < 0 or (int_value == 0 and not allow_zero):
+        raise ValueError(f"{name} must be greater than zero, but got {value!r}.")
+    return int_value
+
+
+def _validate_timeout(value: typing.Any, name: str) -> typing.Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, but got {value!r}.")
+    float_value = float(value)
+    if float_value < 0:
+        raise ValueError(
+            f"{name} must be greater than or equal to zero, got {value!r}."
+        )
+    return float_value
+
+
+class OriginLimits:
+    """
+    Per-origin connection quota configuration.
+
+    Origins are distinguished by their scheme, host and port. A request to an
+    origin that has no `OriginLimits` configured follows the global pool
+    semantics exactly.
+
+    **Parameters:**
+
+    * **max_connections** - The maximum number of requests that may be in flight
+            to the origin at the same time. Further requests wait in an ordered
+            per-origin queue. `None` means no per-origin cap.
+    * **max_keepalive_connections** - The number of idle connections to retain
+            for the origin once in-flight requests complete. `None` means the
+            global keepalive limit applies unchanged.
+    * **pool_timeout** - The maximum time in seconds to wait for the per-origin
+            quota before raising an `OriginPoolTimeout`. This is independent of
+            the global pool timeout. `None` means wait indefinitely.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_connections: int | None = None,
+        max_keepalive_connections: int | None = None,
+        pool_timeout: float | None = 5.0,
+    ) -> None:
+        self.max_connections = _validate_int(max_connections, "max_connections")
+        self.max_keepalive_connections = _validate_int(
+            max_keepalive_connections, "max_keepalive_connections", allow_zero=True
+        )
+        self.pool_timeout = _validate_timeout(pool_timeout, "pool_timeout")
+
+        if (
+            self.max_connections is not None
+            and self.max_keepalive_connections is not None
+            and self.max_keepalive_connections > self.max_connections
+        ):
+            raise ValueError(
+                "max_keepalive_connections must be less than or equal to "
+                "max_connections, but got "
+                f"max_keepalive_connections={self.max_keepalive_connections} and "
+                f"max_connections={self.max_connections}."
+            )
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return (
+            isinstance(other, self.__class__)
+            and self.max_connections == other.max_connections
+            and self.max_keepalive_connections == other.max_keepalive_connections
+            and self.pool_timeout == other.pool_timeout
+        )
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        return (
+            f"{class_name}(max_connections={self.max_connections}, "
+            f"max_keepalive_connections={self.max_keepalive_connections}, "
+            f"pool_timeout={self.pool_timeout})"
+        )
 
 
 def create_ssl_context(
@@ -168,6 +276,11 @@ class Limits:
             keep-alive connections below this point. Should be less than or equal
             to `max_connections`.
     * **keepalive_expiry** - Time limit on idle keep-alive connections in seconds.
+    * **per_origin** - A mapping of origins to `OriginLimits` instances, allowing
+            in-flight caps and idle-connection reserves to be configured per
+            origin. Origins may be given as URLs/strings (eg `"https://example.org"`)
+            or as `(scheme, host, port)` triples. Origins without an entry use the
+            global limits unchanged.
     """
 
     def __init__(
@@ -176,10 +289,73 @@ class Limits:
         max_connections: int | None = None,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = 5.0,
+        per_origin: typing.Mapping[str | URL | OriginKey, OriginLimits] | None = None,
     ) -> None:
         self.max_connections = max_connections
         self.max_keepalive_connections = max_keepalive_connections
         self.keepalive_expiry = keepalive_expiry
+        self.per_origin: dict[OriginKey, OriginLimits] = (
+            self._build_per_origin(per_origin) if per_origin is not None else {}
+        )
+
+    @staticmethod
+    def _build_per_origin(
+        per_origin: typing.Mapping[typing.Any, OriginLimits],
+    ) -> dict[OriginKey, OriginLimits]:
+        if not isinstance(per_origin, typing.Mapping):
+            raise ValueError(
+                "per_origin must be a mapping of origins to OriginLimits, "
+                f"but got {per_origin!r}."
+            )
+
+        origin_limits: dict[OriginKey, OriginLimits] = {}
+        for key, value in per_origin.items():
+            if not isinstance(value, OriginLimits):
+                raise ValueError(
+                    "per_origin values must be OriginLimits instances, "
+                    f"but got {value!r} for origin {key!r}."
+                )
+            origin_limits[Limits._origin_key(key)] = value
+        return origin_limits
+
+    @staticmethod
+    def _origin_key(key: str | URL | OriginKey) -> OriginKey:
+        if isinstance(key, tuple):
+            if (
+                len(key) != 3
+                or not isinstance(key[0], str)
+                or not isinstance(key[1], str)
+                or isinstance(key[2], bool)
+                or not isinstance(key[2], int)
+            ):
+                raise ValueError(
+                    "per_origin tuple keys must be (scheme, host, port), "
+                    f"but got {key!r}."
+                )
+            try:
+                url = URL(f"{key[0]}://{key[1]}:{key[2]}")
+            except Exception as exc:  # pragma: no cover
+                raise ValueError(
+                    f"per_origin origin {key!r} is not a valid origin."
+                ) from exc
+        elif isinstance(key, (str, URL)):
+            url = URL(key)
+        else:
+            raise ValueError(
+                "per_origin keys must be an origin URL/string or a "
+                f"(scheme, host, port) tuple, but got {key!r}."
+            )
+
+        if not url.scheme or not url.host:
+            raise ValueError(
+                f"per_origin origin {key!r} must include scheme, host and port."
+            )
+        if url.scheme not in ("http", "https", "ws", "wss"):
+            raise ValueError(
+                "per_origin origins must use the http, https, ws or wss scheme, "
+                f"but got {key!r}."
+            )
+        return origin_key(url)
 
     def __eq__(self, other: typing.Any) -> bool:
         return (
@@ -187,15 +363,19 @@ class Limits:
             and self.max_connections == other.max_connections
             and self.max_keepalive_connections == other.max_keepalive_connections
             and self.keepalive_expiry == other.keepalive_expiry
+            and self.per_origin == other.per_origin
         )
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        return (
+        repr_str = (
             f"{class_name}(max_connections={self.max_connections}, "
             f"max_keepalive_connections={self.max_keepalive_connections}, "
             f"keepalive_expiry={self.keepalive_expiry})"
         )
+        if self.per_origin:
+            repr_str = f"{repr_str[:-1]}, per_origin={self.per_origin!r})"
+        return repr_str
 
 
 class Proxy:
