@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime
 import enum
 import logging
@@ -22,11 +23,22 @@ from ._config import (
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
+    NestedCapacityError,
+    NestedDepthExceeded,
+    PoolTimeout,
     RemoteProtocolError,
     TooManyRedirects,
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._reentry import (
+    DEFAULT_MAX_NESTED_DEPTH,
+    NestedRequestPolicy,
+    NestedRequestWarning,
+    ReentryConfig,
+    ReentrySource,
+    ReentryState,
+)
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -200,6 +212,8 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        max_nested_depth: int | None = DEFAULT_MAX_NESTED_DEPTH,
+        on_nested_depth: str | NestedRequestPolicy = NestedRequestPolicy.REJECT,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -219,6 +233,52 @@ class BaseClient:
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
+
+        # Reentrancy (nested requests issued from hooks, auth flows or
+        # transport wrappers). The configuration is validated here so that
+        # illegal values fail at client construction, while the mutable state
+        # is isolated per thread/task.
+        self._reentry_config = ReentryConfig.build(
+            max_depth=max_nested_depth, policy=on_nested_depth
+        )
+        self._reentry = ReentryState()
+
+    @property
+    def max_nested_depth(self) -> int | None:
+        """
+        Maximum permitted nesting depth for reentrant requests, or `None`
+        when the depth is unlimited.
+        """
+        return self._reentry_config.max_depth
+
+    @property
+    def on_nested_depth(self) -> NestedRequestPolicy:
+        """
+        Policy applied when a nested request reaches `max_nested_depth`.
+        One of `NestedRequestPolicy.ALLOW`, `.WARN` or `.REJECT`.
+        """
+        return self._reentry_config.policy
+
+    @property
+    def nested_depth(self) -> int:
+        """
+        Reentrant nesting depth on the current thread/task.
+
+        `0` while no request is being sent and for the outermost request;
+        a request issued from a hook, authentication flow or transport
+        wrapper while another send is in progress runs at depth `1`, etc.
+        """
+        return self._reentry.depth
+
+    @property
+    def nested_source(self) -> str | None:
+        """
+        Origin (`"request_hook"`, `"response_hook"`, `"auth"` or
+        `"transport"`) of the nested request currently being sent on this
+        thread/task, or `None` for top-level requests.
+        """
+        origin = self._reentry.origin
+        return None if origin is None else origin.value
 
     @property
     def is_closed(self) -> bool:
@@ -319,7 +379,15 @@ class BaseClient:
     def cookies(self) -> Cookies:
         """
         Cookie values to include when sending requests.
+
+        While a nested (reentrant) request is in progress on the current
+        thread/task this returns an isolated copy, so that `Set-Cookie`
+        writebacks from the nested request never leak into the outer send
+        or into the client's cookie jar.
         """
+        nested_cookies = self._reentry.current_send_cookies()
+        if nested_cookies is not None:
+            return nested_cookies
         return self._cookies
 
     @cookies.setter
@@ -590,6 +658,99 @@ class BaseClient:
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
 
+    def _check_nested_depth(self, request: Request) -> None:
+        """
+        Apply the configured allow/warn/reject policy to the nested request
+        currently being entered on this execution unit. Must be called with
+        the nested send frame already pushed, so `nested_depth` reports the
+        depth this request runs at.
+        """
+        config = self._reentry_config
+        depth = self._reentry.depth
+        if config.max_depth is None or depth <= config.max_depth:
+            return
+
+        origin = self._reentry.origin
+        origin_text = "unknown" if origin is None else origin.value
+        message = (
+            f"Nested request of nesting depth {depth} exceeds "
+            f"max_nested_depth={config.max_depth} configured on this client "
+            f"(origin={origin_text!r}). Increase 'max_nested_depth', or set "
+            "'on_nested_depth' to 'allow' or 'warn' if such reentrancy is "
+            "intended."
+        )
+        if config.policy is NestedRequestPolicy.WARN:
+            warnings.warn(
+                message,
+                NestedRequestWarning,
+                stacklevel=5,
+            )
+        elif config.policy is NestedRequestPolicy.REJECT:
+            raise NestedDepthExceeded(message, request=request)
+
+    @staticmethod
+    def _isolate_nested_auth(auth: Auth) -> Auth:
+        """
+        Return a per-nested-send copy of the auth instance, so that mutable
+        authentication state (e.g. digest challenges) updated by the nested
+        request cannot silently overwrite the outer request's auth state.
+        """
+        try:
+            return copy.copy(auth)
+        except TypeError:  # pragma: no cover
+            return auth
+
+    def _nested_capacity_error(self, request: Request) -> NestedCapacityError:
+        origin = self._reentry.origin
+        origin_text = "unknown" if origin is None else origin.value
+        depth = self._reentry.depth
+        message = (
+            f"Nested request (depth={depth}, origin={origin_text!r}) could not "
+            "acquire a connection, because outer request(s) on the same "
+            "thread/task still hold the connection capacity of this client's "
+            "pool. Reentrant requests do not wait silently for the outer "
+            "requests (their pool timeout is forced to zero); this failure "
+            "signals reentrancy capacity contention rather than an ordinary "
+            "pool timeout. Consume or close the outer response before issuing "
+            "the nested request, or increase the client connection 'limits'."
+        )
+        return NestedCapacityError(message, request=request)
+
+    @contextmanager
+    def _top_level_send(self) -> typing.Iterator[None]:
+        """
+        Frame pushed around a regular, non-nested send.
+        """
+        with self._reentry.send_frame():
+            yield
+
+    @contextmanager
+    def _nested_send_guard(self, request: Request) -> typing.Iterator[None]:
+        """
+        Boundaries applied around a nested (reentrant) send:
+
+        * The nested send gets its own cookie jar, seeded from the current
+          one, so `Set-Cookie` writebacks are discarded when it completes.
+        * The request's pool timeout is forced to zero on an isolated copy
+          of its extensions, so capacity contention with outer requests
+          fails immediately instead of waiting until a timeout fires.
+        * A nested send frame tracks the depth on this execution unit.
+
+        The request's original extensions mapping is restored on exit, so
+        the outer request's timeout override can never be rewritten.
+        """
+        nested_cookies = Cookies(self.cookies)
+        original_extensions = request.extensions
+        timeout_conf = original_extensions.get("timeout")
+        guarded_timeout = dict(timeout_conf) if isinstance(timeout_conf, dict) else {}
+        guarded_timeout["pool"] = 0.0
+        request.extensions = dict(original_extensions, timeout=guarded_timeout)
+        try:
+            with self._reentry.send_frame(cookies=nested_cookies):
+                yield
+        finally:
+            request.extensions = original_extensions
+
 
 class Client(BaseClient):
     """
@@ -634,6 +795,12 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **max_nested_depth** - *(optional)* Maximum nesting depth for reentrant
+    requests (requests issued from event hooks, authentication flows or
+    transport wrappers while another send is in progress on the same
+    thread/task). `None` disables the cap. Default: 4.
+    * **on_nested_depth** - *(optional)* Policy once the nesting depth is
+    reached: `"allow"`, `"warn"` or `"reject"` (the default).
     """
 
     def __init__(
@@ -658,6 +825,8 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        max_nested_depth: int | None = DEFAULT_MAX_NESTED_DEPTH,
+        on_nested_depth: str | NestedRequestPolicy = NestedRequestPolicy.REJECT,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +840,8 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            max_nested_depth=max_nested_depth,
+            on_nested_depth=on_nested_depth,
         )
 
         if http2:
@@ -911,21 +1082,34 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
-        try:
-            if not stream:
-                response.read()
+        # A send issued while this same client is already sending on this
+        # thread is a nested (reentrant) request. Apply the depth policy and
+        # the nested send boundaries; top-level sends only carry a frame.
+        if self._reentry.has_active_send():
+            auth = self._isolate_nested_auth(auth)
+            send_context = self._nested_send_guard(request)
+        else:
+            send_context = self._top_level_send()
 
-            return response
+        with send_context:
+            if self._reentry.is_nested:
+                self._check_nested_depth(request)
 
-        except BaseException as exc:
-            response.close()
-            raise exc
+            response = self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+            )
+            try:
+                if not stream:
+                    response.read()
+
+                return response
+
+            except BaseException as exc:
+                response.close()
+                raise exc
 
     def _send_handling_auth(
         self,
@@ -936,7 +1120,8 @@ class Client(BaseClient):
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
-            request = next(auth_flow)
+            with self._reentry.callback_frame(ReentrySource.AUTH):
+                request = next(auth_flow)
 
             while True:
                 response = self._send_handling_redirects(
@@ -945,10 +1130,11 @@ class Client(BaseClient):
                     history=history,
                 )
                 try:
-                    try:
-                        next_request = auth_flow.send(response)
-                    except StopIteration:
-                        return response
+                    with self._reentry.callback_frame(ReentrySource.AUTH):
+                        try:
+                            next_request = auth_flow.send(response)
+                        except StopIteration:
+                            return response
 
                     response.history = list(history)
                     response.read()
@@ -959,7 +1145,8 @@ class Client(BaseClient):
                     response.close()
                     raise exc
         finally:
-            auth_flow.close()
+            with self._reentry.callback_frame(ReentrySource.AUTH):
+                auth_flow.close()
 
     def _send_handling_redirects(
         self,
@@ -974,12 +1161,14 @@ class Client(BaseClient):
                 )
 
             for hook in self._event_hooks["request"]:
-                hook(request)
+                with self._reentry.callback_frame(ReentrySource.REQUEST_HOOK):
+                    hook(request)
 
             response = self._send_single_request(request)
             try:
                 for hook in self._event_hooks["response"]:
-                    hook(response)
+                    with self._reentry.callback_frame(ReentrySource.RESPONSE_HOOK):
+                        hook(response)
                 response.history = list(history)
 
                 if not response.has_redirect_location:
@@ -1010,8 +1199,17 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        try:
+            with self._reentry.callback_frame(ReentrySource.TRANSPORT):
+                with request_context(request=request):
+                    response = transport.handle_request(request)
+        except PoolTimeout as exc:
+            if self._reentry.is_nested:
+                # A nested request exhausted against connections still held by
+                # outer request(s): fail immediately with a distinguishable
+                # reentrancy error instead of waiting for the pool timeout.
+                raise self._nested_capacity_error(request) from exc
+            raise
 
         assert isinstance(response.stream, SyncByteStream)
 
@@ -1348,6 +1546,12 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **max_nested_depth** - *(optional)* Maximum nesting depth for reentrant
+    requests (requests issued from event hooks, authentication flows or
+    transport wrappers while another send is in progress on the same
+    thread/task). `None` disables the cap. Default: 4.
+    * **on_nested_depth** - *(optional)* Policy once the nesting depth is
+    reached: `"allow"`, `"warn"` or `"reject"` (the default).
     """
 
     def __init__(
@@ -1372,6 +1576,8 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        max_nested_depth: int | None = DEFAULT_MAX_NESTED_DEPTH,
+        on_nested_depth: str | NestedRequestPolicy = NestedRequestPolicy.REJECT,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1591,8 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            max_nested_depth=max_nested_depth,
+            on_nested_depth=on_nested_depth,
         )
 
         if http2:
@@ -1626,21 +1834,34 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = await self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
-        try:
-            if not stream:
-                await response.aread()
+        # A send issued while this same client is already sending on this
+        # task is a nested (reentrant) request. Apply the depth policy and
+        # the nested send boundaries; top-level sends only carry a frame.
+        if self._reentry.has_active_send():
+            auth = self._isolate_nested_auth(auth)
+            send_context = self._nested_send_guard(request)
+        else:
+            send_context = self._top_level_send()
 
-            return response
+        with send_context:
+            if self._reentry.is_nested:
+                self._check_nested_depth(request)
 
-        except BaseException as exc:
-            await response.aclose()
-            raise exc
+            response = await self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+            )
+            try:
+                if not stream:
+                    await response.aread()
+
+                return response
+
+            except BaseException as exc:
+                await response.aclose()
+                raise exc
 
     async def _send_handling_auth(
         self,
@@ -1651,7 +1872,8 @@ class AsyncClient(BaseClient):
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
-            request = await auth_flow.__anext__()
+            with self._reentry.callback_frame(ReentrySource.AUTH):
+                request = await auth_flow.__anext__()
 
             while True:
                 response = await self._send_handling_redirects(
@@ -1660,10 +1882,11 @@ class AsyncClient(BaseClient):
                     history=history,
                 )
                 try:
-                    try:
-                        next_request = await auth_flow.asend(response)
-                    except StopAsyncIteration:
-                        return response
+                    with self._reentry.callback_frame(ReentrySource.AUTH):
+                        try:
+                            next_request = await auth_flow.asend(response)
+                        except StopAsyncIteration:
+                            return response
 
                     response.history = list(history)
                     await response.aread()
@@ -1674,7 +1897,8 @@ class AsyncClient(BaseClient):
                     await response.aclose()
                     raise exc
         finally:
-            await auth_flow.aclose()
+            with self._reentry.callback_frame(ReentrySource.AUTH):
+                await auth_flow.aclose()
 
     async def _send_handling_redirects(
         self,
@@ -1689,12 +1913,14 @@ class AsyncClient(BaseClient):
                 )
 
             for hook in self._event_hooks["request"]:
-                await hook(request)
+                with self._reentry.callback_frame(ReentrySource.REQUEST_HOOK):
+                    await hook(request)
 
             response = await self._send_single_request(request)
             try:
                 for hook in self._event_hooks["response"]:
-                    await hook(response)
+                    with self._reentry.callback_frame(ReentrySource.RESPONSE_HOOK):
+                        await hook(response)
 
                 response.history = list(history)
 
@@ -1726,8 +1952,17 @@ class AsyncClient(BaseClient):
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        try:
+            with self._reentry.callback_frame(ReentrySource.TRANSPORT):
+                with request_context(request=request):
+                    response = await transport.handle_async_request(request)
+        except PoolTimeout as exc:
+            if self._reentry.is_nested:
+                # A nested request exhausted against connections still held by
+                # outer request(s): fail immediately with a distinguishable
+                # reentrancy error instead of waiting for the pool timeout.
+                raise self._nested_capacity_error(request) from exc
+            raise
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request

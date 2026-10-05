@@ -6,6 +6,7 @@ from ._config import *
 from ._content import *
 from ._exceptions import *
 from ._models import *
+from ._reentry import NestedRequestPolicy, NestedRequestWarning, ReentrySource
 from ._status_codes import *
 from ._transports import *
 from ._types import *
@@ -62,6 +63,11 @@ __all__ = [
     "LocalProtocolError",
     "main",
     "MockTransport",
+    "NestedCapacityError",
+    "NestedDepthExceeded",
+    "NestedRequestError",
+    "NestedRequestPolicy",
+    "NestedRequestWarning",
     "NetRCAuth",
     "NetworkError",
     "options",
@@ -75,6 +81,7 @@ __all__ = [
     "QueryParams",
     "ReadError",
     "ReadTimeout",
+    "ReentrySource",
     "RemoteProtocolError",
     "request",
     "Request",

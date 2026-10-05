@@ -2,6 +2,7 @@
 Our exception hierarchy:
 
 * HTTPError
+  x HTTPError
   x RequestError
     + TransportError
       - TimeoutException
@@ -9,6 +10,7 @@ Our exception hierarchy:
         · ReadTimeout
         · WriteTimeout
         · PoolTimeout
+          · NestedCapacityError
       - NetworkError
         · ConnectError
         · ReadError
@@ -21,6 +23,9 @@ Our exception hierarchy:
       - UnsupportedProtocol
     + DecodingError
     + TooManyRedirects
+    + NestedRequestError
+      · NestedDepthExceeded
+      · NestedCapacityError
   x HTTPStatusError
 * InvalidURL
 * CookieConflict
@@ -49,6 +54,9 @@ __all__ = [
     "HTTPStatusError",
     "InvalidURL",
     "LocalProtocolError",
+    "NestedCapacityError",
+    "NestedDepthExceeded",
+    "NestedRequestError",
     "NetworkError",
     "PoolTimeout",
     "ProtocolError",
@@ -249,6 +257,34 @@ class DecodingError(RequestError):
 class TooManyRedirects(RequestError):
     """
     Too many redirects.
+    """
+
+
+class NestedRequestError(RequestError):
+    """
+    Base class for failures caused by a request that was issued reentrantly
+    from a callback (event hook, authentication flow, or transport wrapper)
+    while another request was already being sent on the same client and
+    execution unit (thread/task).
+    """
+
+
+class NestedDepthExceeded(NestedRequestError):
+    """
+    A nested request was rejected (or warned about) because the client's
+    configured maximum nesting depth was exceeded.
+    """
+
+
+class NestedCapacityError(NestedRequestError, PoolTimeout):
+    """
+    A nested request could not acquire connection capacity because an outer
+    request on the same execution unit still holds the pool's capacity.
+
+    Unlike a regular `PoolTimeout`, nested requests never wait silently for
+    the outer request to release a connection: this error is raised
+    immediately, so that reentrancy-induced capacity contention can be told
+    apart from ordinary pool timeouts.
     """
 
 
